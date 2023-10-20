@@ -1,15 +1,32 @@
+from __future__ import annotations
+
+import bz2
 import logging
 import requests
+from typing import Any
+from pathlib import Path
+from requests.exceptions import HTTPError
 
-from django.conf import settings
-from django import forms
-from dateutil.parser import parse
-from crispy_forms.layout import Div, HTML
+from astropy.time import Time
 from astropy import units as u
+from astroquery.gemini import Observations as GOA
+from crispy_forms.layout import Div, HTML
+from dateutil.parser import parse
+from django import forms
+from django.conf import settings
+from django.contrib import messages
 
-from tom_observations.facility import BaseRoboticObservationFacility, BaseRoboticObservationForm
 from tom_common.exceptions import ImproperCredentialsException
+from tom_dataproducts.models import DataProduct
+from tom_dataproducts.utils import create_image_dataproduct
+from tom_observations.facility import BaseRoboticObservationFacility, BaseRoboticObservationForm
+from tom_observations.models import ObservationRecord
 from tom_targets.models import Target
+
+try:
+    AUTO_THUMBNAILS = settings.AUTO_THUMBNAILS
+except AttributeError:
+    AUTO_THUMBNAILS = False
 
 logger = logging.getLogger(__name__)
 
@@ -505,10 +522,137 @@ class GEMFacility(BaseRoboticObservationFacility):
     def _archive_headers(clz):
         return {}
 
-    @classmethod
-    def data_products(clz, observation_record, product_id=None):
-        return []
+    def save_data_products(self, observation_record: ObservationRecord, product_id: str | None = None
+                           ) -> list[DataProduct]:
+        """Save data products related to an observation record.
 
-    @classmethod
-    def _archive_frames(clz, observation_id, product_id=None):
-        return []
+        Parameters
+        ----------
+        observation_record : `ObservationRecord`
+            The observation record object.
+        product_id : `str | None`
+            The ID of the product to download, by default ``None``.
+
+        Returns
+        -------
+        `list[DataProduct]`
+            List of saved DataProduct objects.
+
+        Notes
+        -----
+        Skips downloading if the data is proprietary and the user is not
+        authenticated.
+        """
+        final_products = []
+        target = observation_record.target
+        facility = observation_record.facility
+
+        # Setup paths to download data.
+        target_path = Path(f"{settings.MEDIA_ROOT}/{target.name}")
+        target_facility_path = target_path / facility
+
+        if not target_facility_path.exists():
+            target_facility_path.mkdir(parents=True)
+
+        # Handle case for specific file download.
+        products = self.data_products(observation_record.observation_id, product_id)
+
+        for product in products:
+            if product['is_proprietary'] and not GOA.authenticated():
+                # Skip downloading if proprietary and not authenticated.
+                logger.info("Skipping proprietary file %s", product["filename"])
+                continue
+
+            # Only proceed if the file content was successfully downloaded.
+            dp, created = DataProduct.objects.get_or_create(
+                product_id=product['id'],
+                target=target,
+                observation_record=observation_record,
+            )
+
+            if created:
+                try:
+                    # Users can still try to download proprietary data that
+                    # does not belong to their account.
+                    GOA.get_file(product["filename"], download_dir=target_facility_path)
+                    dp.data.name = f"{target.name}/{facility}/{product['filename']}"
+                    dp.save()
+                    logger.info("Saved new dataproduct: %s", dp.data)
+                except HTTPError as e:
+                    if e.response.status_code == 403:
+                        logger.error("You are not authorized to download this data.")
+                    else:
+                        logger.error("HTTP Error occured: %s", e)
+
+            if AUTO_THUMBNAILS:
+                create_image_dataproduct(dp)
+                dp.get_preview()
+
+            final_products.append(dp)
+
+        return final_products
+
+    def data_products(self, observation_id: str, product_id: str | None = None) -> list[dict[str, Any]]:
+        """Gets the products to save to the observation.
+
+        Parameters
+        ----------
+        observation_id : `str`
+            The observation ID to look for products for.
+        product_id : `str | None`, optional
+            The product ID to match, by default ``None``.
+
+        Returns
+        -------
+        `list[dict[str, Any]]`
+            A list of products for the observation ID.
+        """
+        # Store products.
+        products = []
+
+        # Get file list from GOA.
+        files = GOA.query_criteria(program_id=observation_id)
+        if files is None:
+            return products
+
+        # Look for the product ID if it exists.
+        if product_id is not None:
+            for f in files:
+                if f["name"].strip(".fits") == product_id:
+                    products.append(self._create_data_product_entry(f))
+                    break
+                # TODO: Issue warning that the product was not found.
+
+        # Loop through files and build data products.
+        else:
+            for f in files:
+                products.append(self._create_data_product_entry(f))
+
+        return products
+
+    def _create_data_product_entry(self, product: Any) -> dict[str, Any]:
+        """Creates the entry for a specified product.
+
+        Parameters
+        ----------
+        product : `Any`
+            The product information from GOA, usually a pydantic `BaseModel`.
+
+        Returns
+        -------
+        `dict[str, Any]`
+            A data product entry.
+        """
+        uncompressed_filename = product["name"]
+        release_date = Time(product["release"], format="isot", scale="utc")
+        today_ut = Time.now()
+
+        return {
+            "id": uncompressed_filename.strip(".fits"),
+            "filename": uncompressed_filename,
+            "compressed_filename": product["name"],
+            "created": product["lastmod"],
+            # TODO: Swap to astroquery after PR merge.
+            "url": f"https://archive.gemini.edu/file/{product['name']}",
+            "is_proprietary": today_ut < release_date
+        }
